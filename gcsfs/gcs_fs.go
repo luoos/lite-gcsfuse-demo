@@ -3,16 +3,15 @@ package gcsfs
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"sync"
-	"io"
-	"io/ioutil"
 	"time"
 
+	"cloud.google.com/go/storage"
 	"github.com/jacobsa/fuse"
 	"github.com/jacobsa/fuse/fuseops"
 	"github.com/jacobsa/fuse/fuseutil"
-	"cloud.google.com/go/storage"
 )
 
 /**
@@ -35,6 +34,7 @@ type gcsFS struct {
 	mu     sync.Mutex
 	obj    *storage.ObjectHandle
 	writer *storage.Writer
+	reader *storage.Reader
 }
 
 const gcsFileName = "gcs_file"
@@ -201,20 +201,25 @@ func (fs *gcsFS) OpenFile(
 func (fs *gcsFS) ReadFile(
 	ctx context.Context,
 	op *fuseops.ReadFileOp) error {
+	fmt.Println("ReadFile, offset: ", op.Offset)
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(ctx, time.Second*50)
-	defer cancel()
-
-	rc, err := fs.obj.NewReader(ctx)
-	defer rc.Close()
+	if fs.reader == nil {
+		r, err := fs.obj.NewReader(context.Background())
+		fs.reader = r
+		if err != nil {
+			panic(err)
+		}
+	}
+	br, err := fs.reader.Read(op.Dst)
+	op.BytesRead = br
 	// Currently, only supports small file
-	data, err := ioutil.ReadAll(rc)
 	if err == io.EOF {
 		return nil
+	} else if err != nil {
+		panic(err)
 	}
-	op.BytesRead = copy(op.Dst, data)
 
 	return nil
 }
@@ -222,21 +227,23 @@ func (fs *gcsFS) ReadFile(
 func (fs *gcsFS) WriteFile(
 	ctx context.Context,
 	op *fuseops.WriteFileOp) error {
+	fmt.Println("WriteFile, offset: ", op.Offset)
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	if fs.writer == nil {
-		// TODO: fix this hack
-		// Ideally, this should be done in OpenFile based on the open mode
-		// i.e., read or write
-		// However, I didn't see such arg in OpenFileOp
-		wctx := context.Background()
-		wctx, _ = context.WithTimeout(wctx, time.Second*50)
+		wctx, _ := context.WithTimeout(context.Background(), time.Second*500)
 		fs.writer = fs.obj.NewWriter(wctx)
 	}
-	// TODO: buffer the data, the network IO speed should be lower
-	// don't let the kernel wait for the network IO.
-	// As a result, buffering the data can improve write throughput
-	fs.writer.Write(op.Data)
+	// TODO: the write offset is out of order.
+	// So the file written to GCS is not right, the MD5 check sum is not right
+	byteWritten, err := fs.writer.Write(op.Data)
+	if err != nil {
+		fmt.Printf("Write err: %v\n", err)
+	}
+
+	if l := len(op.Data); l != byteWritten {
+		fmt.Printf("Write length mismatch, wrote length: %v, want: %v \n", byteWritten, l)
+	}
 	return nil
 }
 
@@ -281,6 +288,10 @@ func (fs *gcsFS) ReleaseFileHandle(context.Context, *fuseops.ReleaseFileHandleOp
 	if fs.writer != nil {
 		fs.writer.Close()
 		fs.writer = nil
+	}
+	if fs.reader != nil {
+		fs.reader.Close()
+		fs.reader = nil
 	}
 	return nil
 }
